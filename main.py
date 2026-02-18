@@ -1,9 +1,9 @@
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 import soundfile as sf
 from TTS.api import TTS
 import numpy as np
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.responses import JSONResponse
 from faster_whisper import WhisperModel
 from pathlib import Path
@@ -19,6 +19,106 @@ app = FastAPI(
     version="2.0",
     description="Convert text to natural-sounding speech using a neural TTS model."
 )
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Neural Speech API</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #f8f9fa; padding: 50px; }
+        .container { max-width: 800px; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+        h1 { margin-bottom: 30px; color: #333; }
+        .section { margin-bottom: 40px; }
+        .btn-action { min-width: 150px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1 class="text-center">Neural Speech API Interface</h1>
+        
+        <div class="section">
+            <h3>Text to Speech</h3>
+            <div class="mb-3">
+                <textarea id="tts-text" class="form-control" rows="3" placeholder="Enter text here..."></textarea>
+            </div>
+            <div class="row mb-3">
+                <div class="col">
+                    <label class="form-label">Rate (0.5 - 2.0)</label>
+                    <input type="number" id="tts-rate" class="form-control" value="1.0" step="0.1" min="0.5" max="2.0">
+                </div>
+                <div class="col">
+                    <label class="form-label">Volume (0.5 - 2.0)</label>
+                    <input type="number" id="tts-volume" class="form-control" value="1.0" step="0.1" min="0.5" max="2.0">
+                </div>
+            </div>
+            <button onclick="generateAudio()" class="btn btn-primary btn-action">Generate Audio</button>
+            <div class="mt-3">
+                <audio id="audio-player" controls style="display:none; width: 100%;"></audio>
+            </div>
+        </div>
+
+        <hr>
+
+        <div class="section">
+            <h3>Speech to Text (Transcription)</h3>
+            <div class="mb-3">
+                <input type="file" id="stt-file" class="form-control" accept=".wav,.mp3,.m4a,.flac">
+            </div>
+            <button id="stt-btn" onclick="transcribeAudio()" class="btn btn-success btn-action">Transcribe</button>
+            <div id="stt-result" class="mt-3 p-3 bg-light border rounded" style="display:none;">
+                <h5>Result:</h5>
+                <pre id="stt-json" style="white-space: pre-wrap;"></pre>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function generateAudio() {
+            const text = document.getElementById('tts-text').value;
+            const rate = document.getElementById('tts-rate').value;
+            const volume = document.getElementById('tts-volume').value;
+            if (!text) return alert('Please enter text');
+            
+            const player = document.getElementById('audio-player');
+            player.style.display = 'block';
+            player.src = `/generate-audio?text=${encodeURIComponent(text)}&rate=${rate}&volume=${volume}`;
+            player.play();
+        }
+
+        async function transcribeAudio() {
+            const fileInput = document.getElementById('stt-file');
+            const btn = document.getElementById('stt-btn');
+            if (fileInput.files.length === 0) return alert('Please select a file');
+
+            const formData = new FormData();
+            formData.append('file', fileInput.files[0]);
+
+            const resultDiv = document.getElementById('stt-result');
+            const jsonPre = document.getElementById('stt-json');
+            
+            resultDiv.style.display = 'block';
+            jsonPre.innerText = 'Transcribing...';
+            btn.disabled = true;
+
+            try {
+                const response = await fetch('/transcribe', {
+                    method: 'POST',
+                    body: formData
+                });
+                const result = await response.json();
+                jsonPre.innerText = JSON.stringify(result, null, 2);
+            } catch (error) {
+                jsonPre.innerText = 'Error: ' + error.message;
+            } finally {
+                btn.disabled = false;
+            }
+        }
+    </script>
+</body>
+</html>
+"""
 
 # Load the neural TTS model once at startup for efficiency
 tts_model = TTS(
@@ -83,6 +183,34 @@ async def generate_audio(request: TTSRequest):
             filename="tts_response.wav"
         )
 
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/generate-audio", response_class=FileResponse, tags=["TTS"])
+async def generate_audio_get(
+    text: str = Query(..., description="Text to convert to speech"),
+    rate: float = Query(1.0, ge=0.5, le=2.0, description="Speech speed multiplier"),
+    volume: float = Query(1.0, ge=0.5, le=2.0, description="Volume multiplier")
+):
+    """
+    Generate speech from text via GET request, returning the audio file directly.
+    """
+    try:
+        os.makedirs("audio_files", exist_ok=True)
+        file_name = f"{uuid.uuid4()}.wav"
+        output_path = os.path.join("audio_files", file_name)
+
+        synthesize_speech(text=text, rate=rate, volume=volume, output_path=output_path)
+
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            raise HTTPException(status_code=500, detail="Audio generation failed")
+
+        return FileResponse(
+            path=output_path,
+            media_type="audio/wav",
+            filename="tts_response.wav"
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -161,9 +289,9 @@ async def transcribe(file: UploadFile = File(...)):
             os.remove(temp_filename)
 
 
-@app.get("/", tags=["ROOT"])
+@app.get("/", tags=["ROOT"], response_class=HTMLResponse)
 def root():
     """
-    Health check endpoint to verify API is running.
+    Serve the browser interface.
     """
-    return {"message": "Neural TTS API is running"}
+    return HTML_TEMPLATE
